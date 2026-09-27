@@ -1,0 +1,3 @@
+Multiple Imputation by Chained Equations (MICE) is a flexible and widely used approach for handling missing values in multivariate datasets. The main idea is to iteratively model each variable with missing observations as a function of the other available variables and use the fitted models to generate plausible values for the missing entries.
+
+Unlike single imputation methods, MICE does not replace each missing value with a single deterministic estimate. Instead, it generates multiple imputed datasets, allowing the uncertainty associated with the missing values to be incorporated into subsequent statistical analyses.
