@@ -1,0 +1,1545 @@
+# ============================================================
+# IMPUTATION PIPELINE
+# Order 1 + Order 2
+# MICE + PMM
+# Regression + Residual
+# Random Sampling Fallback
+# ============================================================
+
+
+# ============================================================
+# 1. نصب خودکار بسته‌های مورد نیاز
+# ============================================================
+
+required_packages <- c(
+  "readxl",
+  "mice",
+  "openxlsx"
+)
+
+for (pkg in required_packages) {
+
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+
+    cat(
+      "بسته",
+      pkg,
+      "روی سیستم نصب نیست. در حال نصب...\n"
+    )
+
+    install.packages(
+      pkg,
+      dependencies = TRUE
+    )
+  }
+}
+
+
+# ============================================================
+# 2. بارگذاری بسته‌ها
+# ============================================================
+
+library(readxl)
+library(mice)
+library(openxlsx)
+
+
+# ============================================================
+# 3. مسیر فایل‌ها
+# ============================================================
+
+file_order1 <- "C:\\Users\\user\\Desktop\\مرکز آمار ایران\\Version\\order1_1000.xlsx"
+file_order2 <- "C:\\Users\\user\\Desktop\\مرکز آمار ایران\\Version\\order2_1000.xlsx"
+
+
+# ============================================================
+# 4. خواندن داده‌ها
+# ============================================================
+
+data_order1 <- read_excel(file_order1)
+data_order2 <- read_excel(file_order2)
+
+data_order1 <- as.data.frame(data_order1)
+data_order2 <- as.data.frame(data_order2)
+
+cat("\nداده‌ها با موفقیت خوانده شدند.\n")
+
+
+# ============================================================
+# 5. تعیین آستانه Missing
+# ============================================================
+
+missing_threshold <- 0.50
+
+
+# ============================================================
+# 6. تابع محاسبه درصد Missing
+# ============================================================
+
+missing_rate <- function(x) {
+
+  mean(is.na(x))
+}
+
+
+# ============================================================
+# 7. حذف متغیرهای با Missing زیاد
+# ============================================================
+
+remove_unusable_variables <- function(data,
+                                      threshold = 0.50) {
+
+  miss_rate <- sapply(
+    data,
+    missing_rate
+  )
+
+  # حذف متغیرهایی که Missing آنها >= threshold است
+  keep <- miss_rate < threshold
+
+  data_filtered <- data[, keep, drop = FALSE]
+
+  # حذف متغیرهای کاملاً Missing
+  all_missing <- sapply(
+    data_filtered,
+    function(x) all(is.na(x))
+  )
+
+  data_filtered <- data_filtered[
+    ,
+    !all_missing,
+    drop = FALSE
+  ]
+
+  # حذف متغیرهای بدون تغییر
+  constant <- sapply(
+    data_filtered,
+    function(x) {
+
+      x <- x[!is.na(x)]
+
+      if (length(x) <= 1) {
+        return(TRUE)
+      }
+
+      length(unique(x)) <= 1
+    }
+  )
+
+  data_filtered <- data_filtered[
+    ,
+    !constant,
+    drop = FALSE
+  ]
+
+  return(data_filtered)
+}
+
+
+# ============================================================
+# 8. اعمال فیلتر Missing
+# ============================================================
+
+data_order1_filtered <- remove_unusable_variables(
+  data_order1,
+  missing_threshold
+)
+
+data_order2_filtered <- remove_unusable_variables(
+  data_order2,
+  missing_threshold
+)
+
+
+cat("\n----------------------------------------\n")
+cat("Order 1\n")
+cat("----------------------------------------\n")
+
+cat(
+  "تعداد متغیرهای اولیه:",
+  ncol(data_order1),
+  "\n"
+)
+
+cat(
+  "تعداد متغیرهای پس از فیلتر:",
+  ncol(data_order1_filtered),
+  "\n"
+)
+
+
+cat("\n----------------------------------------\n")
+cat("Order 2\n")
+cat("----------------------------------------\n")
+
+cat(
+  "تعداد متغیرهای اولیه:",
+  ncol(data_order2),
+  "\n"
+)
+
+cat(
+  "تعداد متغیرهای پس از فیلتر:",
+  ncol(data_order2_filtered),
+  "\n"
+)
+
+
+# ============================================================
+# 9. تبدیل متغیرهای متنی به Numeric در صورت امکان
+# ============================================================
+
+convert_numeric_variables <- function(data) {
+
+  for (j in seq_along(data)) {
+
+    x <- data[[j]]
+
+    if (is.character(x)) {
+
+      suppressWarnings(
+        x_num <- as.numeric(x)
+      )
+
+      valid_original <- !is.na(x)
+      valid_numeric <- !is.na(x_num)
+
+      if (sum(valid_original) > 0) {
+
+        conversion_rate <-
+          sum(valid_numeric & valid_original) /
+          sum(valid_original)
+
+        # اگر حداقل 90 درصد مقادیر قابل تبدیل باشند
+        if (conversion_rate >= 0.90) {
+
+          data[[j]] <- x_num
+        }
+      }
+    }
+  }
+
+  return(data)
+}
+
+
+data_order1_filtered <-
+  convert_numeric_variables(
+    data_order1_filtered
+  )
+
+data_order2_filtered <-
+  convert_numeric_variables(
+    data_order2_filtered
+  )
+
+
+# ============================================================
+# 10. ساخت Predictor Matrix
+# ============================================================
+
+create_predictor_matrix <- function(data,
+                                    max_predictors = 5) {
+
+  p <- ncol(data)
+
+  predictor_matrix <- matrix(
+    0,
+    nrow = p,
+    ncol = p
+  )
+
+  rownames(predictor_matrix) <- colnames(data)
+  colnames(predictor_matrix) <- colnames(data)
+
+  numeric_vars <- names(
+    data
+  )[
+    sapply(
+      data,
+      is.numeric
+    )
+  ]
+
+  for (target in numeric_vars) {
+
+    # فقط متغیرهایی که با target هم داده مشاهده‌شده دارند
+    correlations <- c()
+
+    for (pred in numeric_vars) {
+
+      if (pred == target) {
+        next
+      }
+
+      complete_rows <- complete.cases(
+        data[[target]],
+        data[[pred]]
+      )
+
+      if (sum(complete_rows) < 3) {
+        next
+      }
+
+      x <- data[[target]][complete_rows]
+      y <- data[[pred]][complete_rows]
+
+      if (
+        sd(x) == 0 ||
+        sd(y) == 0
+      ) {
+        next
+      }
+
+      cor_value <- suppressWarnings(
+        cor(
+          x,
+          y,
+          method = "pearson"
+        )
+      )
+
+      if (!is.na(cor_value)) {
+
+        correlations[pred] <-
+          abs(cor_value)
+      }
+    }
+
+    if (length(correlations) > 0) {
+
+      selected <- names(
+        sort(
+          correlations,
+          decreasing = TRUE
+        )
+      )
+
+      selected <- head(
+        selected,
+        max_predictors
+      )
+
+      predictor_matrix[
+        target,
+        selected
+      ] <- 1
+    }
+  }
+
+  return(predictor_matrix)
+}
+
+
+predictor_matrix1 <-
+  create_predictor_matrix(
+    data_order1_filtered,
+    max_predictors = 5
+  )
+
+predictor_matrix2 <-
+  create_predictor_matrix(
+    data_order2_filtered,
+    max_predictors = 5
+  )
+
+
+# ============================================================
+# 11. حذف همبستگی بسیار بالا
+# ============================================================
+
+remove_collinear_predictors <- function(
+    data,
+    predictor_matrix,
+    threshold = 0.999) {
+
+  vars <- colnames(data)
+
+  for (target in vars) {
+
+    preds <- vars[
+      predictor_matrix[target, ] == 1
+    ]
+
+    if (length(preds) <= 1) {
+      next
+    }
+
+    preds <- preds[
+      sapply(
+        data[preds],
+        is.numeric
+      )
+    ]
+
+    if (length(preds) <= 1) {
+      next
+    }
+
+    repeat {
+
+      if (length(preds) <= 1) {
+        break
+      }
+
+      cor_matrix <- suppressWarnings(
+        cor(
+          data[preds],
+          use = "pairwise.complete.obs"
+        )
+      )
+
+      if (all(is.na(cor_matrix))) {
+        break
+      }
+
+      cor_matrix[
+        lower.tri(cor_matrix, diag = TRUE)
+      ] <- NA
+
+      max_cor <- max(
+        abs(cor_matrix),
+        na.rm = TRUE
+      )
+
+      if (
+        !is.finite(max_cor) ||
+        max_cor <= threshold
+      ) {
+        break
+      }
+
+      position <- which(
+        abs(cor_matrix) == max_cor,
+        arr.ind = TRUE
+      )[1, ]
+
+      var1 <- colnames(cor_matrix)[position[1]]
+      var2 <- colnames(cor_matrix)[position[2]]
+
+      # متغیری که Missing بیشتری دارد حذف می‌شود
+      miss1 <- mean(
+        is.na(data[[var1]])
+      )
+
+      miss2 <- mean(
+        is.na(data[[var2]])
+      )
+
+      if (miss1 >= miss2) {
+
+        remove_var <- var1
+
+      } else {
+
+        remove_var <- var2
+      }
+
+      cat(
+        "حذف predictor با همبستگی بالا برای",
+        target,
+        ":",
+        remove_var,
+        "\n"
+      )
+
+      predictor_matrix[
+        target,
+        remove_var
+      ] <- 0
+
+      preds <- setdiff(
+        preds,
+        remove_var
+      )
+    }
+  }
+
+  return(predictor_matrix)
+}
+
+
+predictor_matrix1 <-
+  remove_collinear_predictors(
+    data_order1_filtered,
+    predictor_matrix1,
+    threshold = 0.999
+  )
+
+predictor_matrix2 <-
+  remove_collinear_predictors(
+    data_order2_filtered,
+    predictor_matrix2,
+    threshold = 0.999
+  )
+
+
+# ============================================================
+# 12. حذف هم‌خطی چندمتغیره
+# ============================================================
+
+remove_singular_predictors <- function(
+    data,
+    predictor_matrix) {
+
+  vars <- colnames(data)
+
+  for (target in vars) {
+
+    preds <- vars[
+      predictor_matrix[target, ] == 1
+    ]
+
+    if (length(preds) <= 1) {
+      next
+    }
+
+    preds <- preds[
+      sapply(
+        data[preds],
+        is.numeric
+      )
+    ]
+
+    if (length(preds) <= 1) {
+      next
+    }
+
+    # حذف متغیرهای بدون واریانس
+    valid_preds <- preds[
+      sapply(
+        data[preds],
+        function(x) {
+
+          x <- x[!is.na(x)]
+
+          length(x) > 1 &&
+            sd(x) > 0
+        }
+      )
+    ]
+
+    preds <- valid_preds
+
+    if (length(preds) <= 1) {
+
+      predictor_matrix[target, ] <- 0
+
+      if (length(preds) == 1) {
+
+        predictor_matrix[
+          target,
+          preds
+        ] <- 1
+      }
+
+      next
+    }
+
+    temp <- data[preds]
+
+    complete_rows <- complete.cases(
+      temp
+    )
+
+    temp <- temp[
+      complete_rows,
+      ,
+      drop = FALSE
+    ]
+
+    if (nrow(temp) < 3) {
+      next
+    }
+
+    # حذف تدریجی متغیرهای هم‌خط
+    repeat {
+
+      if (ncol(temp) <= 1) {
+        break
+      }
+
+      qr_result <- qr(
+        as.matrix(temp)
+      )
+
+      # ماتریس full rank است
+      if (
+        qr_result$rank ==
+        ncol(temp)
+      ) {
+        break
+      }
+
+      remove_index <-
+        qr_result$pivot[
+          qr_result$rank + 1
+        ]
+
+      remove_var <-
+        colnames(temp)[
+          remove_index
+        ]
+
+      cat(
+        "حذف predictor هم‌خط برای",
+        target,
+        ":",
+        remove_var,
+        "\n"
+      )
+
+      predictor_matrix[
+        target,
+        remove_var
+      ] <- 0
+
+      temp <- temp[
+        ,
+        setdiff(
+          colnames(temp),
+          remove_var
+        ),
+        drop = FALSE
+      ]
+    }
+  }
+
+  return(predictor_matrix)
+}
+
+
+predictor_matrix1 <-
+  remove_singular_predictors(
+    data_order1_filtered,
+    predictor_matrix1
+  )
+
+predictor_matrix2 <-
+  remove_singular_predictors(
+    data_order2_filtered,
+    predictor_matrix2
+  )
+
+
+# ============================================================
+# 13. ساخت Method برای MICE
+# ============================================================
+
+method1 <- make.method(
+  data_order1_filtered
+)
+
+method2 <- make.method(
+  data_order2_filtered
+)
+
+
+# فقط متغیرهای عددی با Missing از PMM استفاده کنند
+for (j in seq_along(data_order1_filtered)) {
+
+  if (
+    is.numeric(
+      data_order1_filtered[[j]]
+    ) &&
+    any(
+      is.na(
+        data_order1_filtered[[j]]
+      )
+    )
+  ) {
+
+    method1[j] <- "pmm"
+  } else {
+
+    method1[j] <- ""
+  }
+}
+
+
+for (j in seq_along(data_order2_filtered)) {
+
+  if (
+    is.numeric(
+      data_order2_filtered[[j]]
+    ) &&
+    any(
+      is.na(
+        data_order2_filtered[[j]]
+      )
+    )
+  ) {
+
+    method2[j] <- "pmm"
+  } else {
+
+    method2[j] <- ""
+  }
+}
+
+
+# ============================================================
+# 14. حذف Method برای متغیرهایی که Predictor ندارند
+# ============================================================
+
+for (i in seq_len(nrow(predictor_matrix1))) {
+
+  target <- rownames(
+    predictor_matrix1
+  )[i]
+
+  if (
+    method1[target] != "" &&
+    sum(
+      predictor_matrix1[target, ]
+    ) == 0
+  ) {
+
+    method1[target] <- ""
+
+    cat(
+      "برای",
+      target,
+      "predictor قابل استفاده وجود ندارد؛",
+      "به fallback سپرده شد.\n"
+    )
+  }
+}
+
+
+for (i in seq_len(nrow(predictor_matrix2))) {
+
+  target <- rownames(
+    predictor_matrix2
+  )[i]
+
+  if (
+    method2[target] != "" &&
+    sum(
+      predictor_matrix2[target, ]
+    ) == 0
+  ) {
+
+    method2[target] <- ""
+
+    cat(
+      "برای",
+      target,
+      "predictor قابل استفاده وجود ندارد؛",
+      "به fallback سپرده شد.\n"
+    )
+  }
+}
+
+
+# ============================================================
+# 15. تابع اجرای امن MICE
+# ============================================================
+
+run_mice_safe <- function(
+    data,
+    method,
+    predictor_matrix,
+    seed = 123) {
+
+  result_data <- data
+  mice_object <- NULL
+
+  if (
+    sum(is.na(data)) == 0
+  ) {
+
+    cat(
+      "هیچ Missingای وجود ندارد؛ MICE اجرا نمی‌شود.\n"
+    )
+
+    return(
+      list(
+        data = result_data,
+        mice = NULL,
+        success = TRUE
+      )
+    )
+  }
+
+  tryCatch({
+
+    mice_object <- mice(
+      data,
+      m = 1,
+      method = method,
+      predictorMatrix = predictor_matrix,
+      seed = seed,
+      maxit = 10,
+      printFlag = TRUE
+    )
+
+    result_data <-
+      complete(
+        mice_object,
+        1
+      )
+
+    cat(
+      "\nMICE با موفقیت اجرا شد.\n"
+    )
+
+    return(
+      list(
+        data = result_data,
+        mice = mice_object,
+        success = TRUE
+      )
+    )
+
+  }, error = function(e) {
+
+    cat(
+      "\n⚠️ MICE با خطا مواجه شد:\n"
+    )
+
+    cat(
+      conditionMessage(e),
+      "\n"
+    )
+
+    cat(
+      "\nادامه کار با روش‌های جایگزین...\n"
+    )
+
+    return(
+      list(
+        data = data,
+        mice = NULL,
+        success = FALSE
+      )
+    )
+  })
+}
+
+
+# ============================================================
+# 16. اجرای MICE برای Order 1
+# ============================================================
+
+cat("\n========================================\n")
+cat("MICE - ORDER 1\n")
+cat("========================================\n")
+
+result1 <- run_mice_safe(
+  data_order1_filtered,
+  method1,
+  predictor_matrix1,
+  seed = 123
+)
+
+data_order1_imputed <-
+  result1$data
+
+imputation1 <-
+  result1$mice
+
+
+# ============================================================
+# 17. اجرای MICE برای Order 2
+# ============================================================
+
+cat("\n========================================\n")
+cat("MICE - ORDER 2\n")
+cat("========================================\n")
+
+result2 <- run_mice_safe(
+  data_order2_filtered,
+  method2,
+  predictor_matrix2,
+  seed = 456
+)
+
+data_order2_imputed <-
+  result2$data
+
+imputation2 <-
+  result2$mice
+
+
+# ============================================================
+# 18. تابع Regression + Residual
+# ============================================================
+
+fallback_regression_imputation <- function(
+    original_data,
+    imputed_data,
+    predictor_matrix) {
+
+  log <- data.frame(
+    Variable = character(),
+    Method = character(),
+    N_Imputed = integer(),
+    stringsAsFactors = FALSE
+  )
+
+  vars <- colnames(
+    original_data
+  )
+
+  for (target in vars) {
+
+    missing_rows <- which(
+      is.na(
+        original_data[[target]]
+      )
+    )
+
+    if (
+      length(missing_rows) == 0
+    ) {
+      next
+    }
+
+    # فقط متغیرهای عددی
+    if (
+      !is.numeric(
+        original_data[[target]]
+      )
+    ) {
+      next
+    }
+
+    predictors <- vars[
+      predictor_matrix[target, ] == 1
+    ]
+
+    predictors <- predictors[
+      sapply(
+        original_data[predictors],
+        is.numeric
+      )
+    ]
+
+    if (
+      length(predictors) == 0
+    ) {
+      next
+    }
+
+    # فقط complete cases برای آموزش مدل
+    train_data <- original_data[
+      ,
+      c(target, predictors),
+      drop = FALSE
+    ]
+
+    train_data <- train_data[
+      complete.cases(train_data),
+      ,
+      drop = FALSE
+    ]
+
+    if (
+      nrow(train_data) < 10
+    ) {
+      next
+    }
+
+    # فرمول
+    formula <- as.formula(
+      paste(
+        target,
+        "~",
+        paste(
+          predictors,
+          collapse = " + "
+        )
+      )
+    )
+
+    model <- tryCatch(
+
+      lm(
+        formula,
+        data = train_data
+      ),
+
+      error = function(e)
+        NULL
+    )
+
+    if (
+      is.null(model)
+    ) {
+      next
+    }
+
+    # ردیف‌های دارای predictor برای پیش‌بینی
+    new_data <- imputed_data[
+      missing_rows,
+      predictors,
+      drop = FALSE
+    ]
+
+    valid_prediction <- complete.cases(
+      new_data
+    )
+
+    if (
+      !any(valid_prediction)
+    ) {
+      next
+    }
+
+    predicted <- tryCatch(
+
+      predict(
+        model,
+        newdata = new_data[
+          valid_prediction,
+          ,
+          drop = FALSE
+        ]
+      ),
+
+      error = function(e)
+        NULL
+    )
+
+    if (
+      is.null(predicted)
+    ) {
+      next
+    }
+
+    # محاسبه residual
+    residuals_model <- residuals(
+      model
+    )
+
+    residual_sd <- sd(
+      residuals_model,
+      na.rm = TRUE
+    )
+
+    if (
+      !is.finite(residual_sd)
+    ) {
+      residual_sd <- 0
+    }
+
+    # اضافه کردن residual تصادفی
+    predicted <- predicted +
+      rnorm(
+        length(predicted),
+        mean = 0,
+        sd = residual_sd
+      )
+
+    rows_to_fill <-
+      missing_rows[
+        valid_prediction
+      ]
+
+    # اگر متغیر ذاتاً غیرمنفی باشد
+    observed_values <-
+      original_data[[target]][
+        !is.na(
+          original_data[[target]]
+        )
+      ]
+
+    if (
+      length(observed_values) > 0 &&
+      all(
+        observed_values >= 0
+      )
+    ) {
+
+      predicted[
+        predicted < 0
+      ] <- 0
+    }
+
+    imputed_data[
+      rows_to_fill,
+      target
+    ] <- predicted
+
+    log <- rbind(
+      log,
+      data.frame(
+        Variable = target,
+        Method = "Regression + Residual",
+        N_Imputed = length(
+          rows_to_fill
+        ),
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+
+  return(
+    list(
+      data = imputed_data,
+      log = log
+    )
+  )
+}
+
+
+# ============================================================
+# 19. تابع Random Sampling
+# ============================================================
+
+random_sampling_imputation <- function(
+    original_data,
+    imputed_data) {
+
+  log <- data.frame(
+    Variable = character(),
+    Method = character(),
+    N_Imputed = integer(),
+    stringsAsFactors = FALSE
+  )
+
+  vars <- colnames(
+    original_data
+  )
+
+  for (target in vars) {
+
+    missing_rows <- which(
+      is.na(
+        imputed_data[[target]]
+      )
+    )
+
+    if (
+      length(missing_rows) == 0
+    ) {
+      next
+    }
+
+    observed_values <-
+      original_data[[target]][
+        !is.na(
+          original_data[[target]]
+        )
+      ]
+
+    if (
+      length(observed_values) == 0
+    ) {
+      next
+    }
+
+    sampled_values <- sample(
+      observed_values,
+      size = length(missing_rows),
+      replace = TRUE
+    )
+
+    imputed_data[
+      missing_rows,
+      target
+    ] <- sampled_values
+
+    log <- rbind(
+      log,
+      data.frame(
+        Variable = target,
+        Method = "Random Sampling",
+        N_Imputed = length(
+          missing_rows
+        ),
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+
+  return(
+    list(
+      data = imputed_data,
+      log = log
+    )
+  )
+}
+
+
+# ============================================================
+# 20. اجرای Regression برای Order 1
+# ============================================================
+
+cat("\n========================================\n")
+cat("Regression fallback - ORDER 1\n")
+cat("========================================\n")
+
+reg1 <- fallback_regression_imputation(
+  data_order1_filtered,
+  data_order1_imputed,
+  predictor_matrix1
+)
+
+data_order1_imputed <-
+  reg1$data
+
+log_order1 <-
+  reg1$log
+
+
+# ============================================================
+# 21. اجرای Random Sampling برای Order 1
+# ============================================================
+
+sample1 <- random_sampling_imputation(
+  data_order1_filtered,
+  data_order1_imputed
+)
+
+data_order1_imputed <-
+  sample1$data
+
+log_order1 <-
+  rbind(
+    log_order1,
+    sample1$log
+  )
+
+
+# ============================================================
+# 22. اجرای Regression برای Order 2
+# ============================================================
+
+cat("\n========================================\n")
+cat("Regression fallback - ORDER 2\n")
+cat("========================================\n")
+
+reg2 <- fallback_regression_imputation(
+  data_order2_filtered,
+  data_order2_imputed,
+  predictor_matrix2
+)
+
+data_order2_imputed <-
+  reg2$data
+
+log_order2 <-
+  reg2$log
+
+
+# ============================================================
+# 23. اجرای Random Sampling برای Order 2
+# ============================================================
+
+sample2 <- random_sampling_imputation(
+  data_order2_filtered,
+  data_order2_imputed
+)
+
+data_order2_imputed <-
+  sample2$data
+
+log_order2 <-
+  rbind(
+    log_order2,
+    sample2$log
+  )
+
+
+# ============================================================
+# 24. بررسی Missing باقی‌مانده
+# ============================================================
+
+remaining1 <- sapply(
+  data_order1_imputed,
+  function(x) sum(is.na(x))
+)
+
+remaining2 <- sapply(
+  data_order2_imputed,
+  function(x) sum(is.na(x))
+)
+
+
+cat("\n========================================\n")
+cat("کنترل نهایی Missing\n")
+cat("========================================\n")
+
+cat(
+  "\nOrder 1 - تعداد کل Missing باقی‌مانده:",
+  sum(remaining1),
+  "\n"
+)
+
+cat(
+  "Order 2 - تعداد کل Missing باقی‌مانده:",
+  sum(remaining2),
+  "\n"
+)
+
+
+if (
+  sum(remaining1) > 0
+) {
+
+  cat(
+    "\n⚠️ متغیرهای دارای Missing در Order 1:\n"
+  )
+
+  print(
+    remaining1[
+      remaining1 > 0
+    ]
+  )
+}
+
+
+if (
+  sum(remaining2) > 0
+) {
+
+  cat(
+    "\n⚠️ متغیرهای دارای Missing در Order 2:\n"
+  )
+
+  print(
+    remaining2[
+      remaining2 > 0
+    ]
+  )
+}
+
+
+# ============================================================
+# 25. ترکیب داده‌های Order 1 و Order 2
+# ============================================================
+
+data_complete <- cbind(
+  data_order1_imputed,
+  data_order2_imputed
+)
+
+
+# ============================================================
+# 26. بررسی Missing نهایی
+# ============================================================
+
+final_missing <- sapply(
+  data_complete,
+  function(x) sum(is.na(x))
+)
+
+cat("\n========================================\n")
+cat("نتیجه نهایی\n")
+cat("========================================\n")
+
+cat(
+  "تعداد سطرها:",
+  nrow(data_complete),
+  "\n"
+)
+
+cat(
+  "تعداد ستون‌ها:",
+  ncol(data_complete),
+  "\n"
+)
+
+cat(
+  "تعداد کل Missing:",
+  sum(final_missing),
+  "\n"
+)
+
+# ============================================================
+# 27. ساخت گزارش Missing نهایی
+# ============================================================
+
+# تعداد Missing قبل از جایگذاری
+missing_before_order1 <- sapply(
+  data_order1_filtered,
+  function(x) sum(is.na(x))
+)
+
+missing_before_order2 <- sapply(
+  data_order2_filtered,
+  function(x) sum(is.na(x))
+)
+
+
+# تعداد Missing بعد از جایگذاری
+missing_after_order1 <- sapply(
+  data_order1_imputed,
+  function(x) sum(is.na(x))
+)
+
+missing_after_order2 <- sapply(
+  data_order2_imputed,
+  function(x) sum(is.na(x))
+)
+
+
+# گزارش Order 1
+report_order1 <- data.frame(
+
+  Order = "Order 1",
+
+  Variable =
+    names(missing_before_order1),
+
+  Missing_Before =
+    as.numeric(missing_before_order1),
+
+  Missing_After =
+    as.numeric(
+      missing_after_order1[
+        names(missing_before_order1)
+      ]
+    ),
+
+  Imputed =
+    as.numeric(missing_before_order1) -
+    as.numeric(
+      missing_after_order1[
+        names(missing_before_order1)
+      ]
+    ),
+
+  stringsAsFactors = FALSE
+)
+
+
+# گزارش Order 2
+report_order2 <- data.frame(
+
+  Order = "Order 2",
+
+  Variable =
+    names(missing_before_order2),
+
+  Missing_Before =
+    as.numeric(missing_before_order2),
+
+  Missing_After =
+    as.numeric(
+      missing_after_order2[
+        names(missing_before_order2)
+      ]
+    ),
+
+  Imputed =
+    as.numeric(missing_before_order2) -
+    as.numeric(
+      missing_after_order2[
+        names(missing_before_order2)
+      ]
+    ),
+
+  stringsAsFactors = FALSE
+)
+
+
+# ترکیب دو گزارش
+final_missing_report <- rbind(
+  report_order1,
+  report_order2
+)
+
+
+# ============================================================
+# 28. گزارش روش‌های جایگذاری
+# ============================================================
+
+imputation_log <- rbind(
+  log_order1,
+  log_order2
+)
+
+
+# ============================================================
+# 29. کنترل نهایی
+# ============================================================
+
+final_missing <- sapply(
+  data_complete,
+  function(x) sum(is.na(x))
+)
+
+cat("\n========================================\n")
+cat("گزارش نهایی\n")
+cat("========================================\n")
+
+cat(
+  "تعداد متغیرهای نهایی:",
+  ncol(data_complete),
+  "\n"
+)
+
+cat(
+  "تعداد کل Missing باقی‌مانده:",
+  sum(final_missing),
+  "\n"
+)
+
+
+if (sum(final_missing) == 0) {
+
+  cat(
+    "✓ هیچ Missingای در داده نهایی وجود ندارد.\n"
+  )
+
+} else {
+
+  cat(
+    "⚠️ هنوز Missing وجود دارد.\n"
+  )
+
+  print(
+    final_missing[
+      final_missing > 0
+    ]
+  )
+}
+
+
+# ============================================================
+# 30. خروجی Excel
+# ============================================================
+
+output_file <-
+  "C:\\Users\\user\\Desktop\\مرکز آمار ایران\\Version\\data_complete_imputed.xlsx"
+
+
+write.xlsx(
+
+  list(
+
+    Data_Complete =
+      data_complete,
+
+    Order1_Imputed =
+      data_order1_imputed,
+
+    Order2_Imputed =
+      data_order2_imputed,
+
+    Imputation_Log =
+      imputation_log,
+
+    Final_Missing_Report =
+      final_missing_report
+
+  ),
+
+  output_file,
+
+  overwrite = TRUE
+)
+
+
+# ============================================================
+# 31. پایان
+# ============================================================
+
+cat("\n========================================\n")
+cat("✓ فرایند جایگذاری داده‌های گمشده به پایان رسید.\n")
+cat("✓ فایل خروجی ایجاد شد:\n")
+cat(output_file, "\n")
+cat("========================================\n")
